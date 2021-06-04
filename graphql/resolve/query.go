@@ -25,7 +25,7 @@ import (
 	"github.com/golang/glog"
 	otrace "go.opencensus.io/trace"
 
-	dgoapi "github.com/dgraph-io/dgo/v200/protos/api"
+	dgoapi "github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/graphql/dgraph"
 	"github.com/dgraph-io/dgraph/graphql/schema"
@@ -56,14 +56,22 @@ func (qr QueryResolverFunc) Resolve(ctx context.Context, query schema.Query) *Re
 // NewQueryResolver creates a new query resolver.  The resolver runs the pipeline:
 // 1) rewrite the query using qr (return error if failed)
 // 2) execute the rewritten query with ex (return error if failed)
+// 3) process the result with rc
 func NewQueryResolver(qr QueryRewriter, ex DgraphExecutor) QueryResolver {
-	return &queryResolver{queryRewriter: qr, executor: ex}
+	return &queryResolver{queryRewriter: qr, executor: ex, resultCompleter: CompletionFunc(noopCompletion)}
+}
+
+// NewEntitiesQueryResolver creates a new query resolver for `_entities` query.
+// It is introduced because result completion works little different for `_entities` query.
+func NewEntitiesQueryResolver(qr QueryRewriter, ex DgraphExecutor) QueryResolver {
+	return &queryResolver{queryRewriter: qr, executor: ex, resultCompleter: CompletionFunc(entitiesQueryCompletion)}
 }
 
 // a queryResolver can resolve a single GraphQL query field.
 type queryResolver struct {
-	queryRewriter QueryRewriter
-	executor      DgraphExecutor
+	queryRewriter   QueryRewriter
+	executor        DgraphExecutor
+	resultCompleter ResultCompleter
 }
 
 func (qr *queryResolver) Resolve(ctx context.Context, query schema.Query) *Resolved {
@@ -82,6 +90,7 @@ func (qr *queryResolver) Resolve(ctx context.Context, query schema.Query) *Resol
 	defer timer.Stop()
 
 	resolved := qr.rewriteAndExecute(ctx, query)
+	qr.resultCompleter.Complete(ctx, resolved)
 	resolverTrace.Dgraph = resolved.Extensions.Tracing.Execution.Resolvers[0].Dgraph
 	resolved.Extensions.Tracing.Execution.Resolvers[0] = resolverTrace
 	return resolved
@@ -140,12 +149,13 @@ func (qr *queryResolver) rewriteAndExecute(ctx context.Context, query schema.Que
 	return resolved
 }
 
-func NewCustomDQLQueryResolver(ex DgraphExecutor) QueryResolver {
-	return &customDQLQueryResolver{executor: ex}
+func NewCustomDQLQueryResolver(qr QueryRewriter, ex DgraphExecutor) QueryResolver {
+	return &customDQLQueryResolver{queryRewriter: qr, executor: ex}
 }
 
 type customDQLQueryResolver struct {
-	executor DgraphExecutor
+	queryRewriter QueryRewriter
+	executor      DgraphExecutor
 }
 
 func (qr *customDQLQueryResolver) Resolve(ctx context.Context, query schema.Query) *Resolved {
@@ -188,23 +198,22 @@ func (qr *customDQLQueryResolver) rewriteAndExecute(ctx context.Context,
 		return resolved
 	}
 
-	dgQuery := query.DQLQuery()
-	args := query.Arguments()
-	vars := make(map[string]string)
-	for k, v := range args {
-		// dgoapi.Request{}.Vars accepts only string values for variables,
-		// so need to convert all variable values to string
-		vStr, err := convertScalarToString(v)
-		if err != nil {
-			return emptyResult(schema.GQLWrapf(err, "couldn't convert argument %s to string", k))
-		}
-		// the keys in dgoapi.Request{}.Vars are assumed to be prefixed with $
-		vars["$"+k] = vStr
+	vars, err := dqlVars(query.Arguments())
+	if err != nil {
+		return emptyResult(err)
 	}
+
+	dgQuery, err := qr.queryRewriter.Rewrite(ctx, query)
+	if err != nil {
+		return emptyResult(schema.GQLWrapf(err, "got error while rewriting DQL query"))
+	}
+
+	qry := dgraph.AsString(dgQuery)
 
 	queryTimer := newtimer(ctx, &dgraphQueryDuration.OffsetDuration)
 	queryTimer.Start()
-	resp, err := qr.executor.Execute(ctx, &dgoapi.Request{Query: dgQuery, Vars: vars,
+
+	resp, err := qr.executor.Execute(ctx, &dgoapi.Request{Query: qry, Vars: vars,
 		ReadOnly: true}, nil)
 	queryTimer.Stop()
 
@@ -253,4 +262,19 @@ func convertScalarToString(val interface{}) (string, error) {
 		return "", errNotScalar
 	}
 	return str, nil
+}
+
+func dqlVars(args map[string]interface{}) (map[string]string, error) {
+	vars := make(map[string]string)
+	for k, v := range args {
+		// dgoapi.Request{}.Vars accepts only string values for variables,
+		// so need to convert all variable values to string
+		vStr, err := convertScalarToString(v)
+		if err != nil {
+			return vars, schema.GQLWrapf(err, "couldn't convert argument %s to string", k)
+		}
+		// the keys in dgoapi.Request{}.Vars are assumed to be prefixed with $
+		vars["$"+k] = vStr
+	}
+	return vars, nil
 }

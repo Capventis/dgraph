@@ -59,7 +59,7 @@ func workerPort() int {
 func Init(ps *badger.DB) {
 	pstore = ps
 	// needs to be initialized after group config
-	limiter = rateLimiter{c: sync.NewCond(&sync.Mutex{}), max: x.WorkerConfig.NumPendingProposals}
+	limiter = rateLimiter{c: sync.NewCond(&sync.Mutex{}), max: int(x.WorkerConfig.Raft.GetInt64("pending-proposals"))}
 	go limiter.bleed()
 
 	grpcOpts := []grpc.ServerOption{
@@ -79,6 +79,9 @@ func Init(ps *badger.DB) {
 type grpcWorker struct {
 	sync.Mutex
 }
+
+// grpcWorker implements pb.WorkerServer.
+var _ pb.WorkerServer = (*grpcWorker)(nil)
 
 func (w *grpcWorker) Subscribe(
 	req *pb.SubscriptionRequest, stream pb.Worker_SubscribeServer) error {
@@ -149,7 +152,7 @@ func UpdateCacheMb(memoryMB int64) error {
 		return errors.Errorf("cache_mb must be non-negative")
 	}
 
-	cachePercent, err := x.GetCachePercentages(Config.CachePercentage, 4)
+	cachePercent, err := x.GetCachePercentages(Config.CachePercentage, 3)
 	if err != nil {
 		return err
 	}
@@ -164,6 +167,8 @@ func UpdateCacheMb(memoryMB int64) error {
 	if _, err := pstore.CacheMaxCost(badger.IndexCache, indexCacheSize); err != nil {
 		return errors.Wrapf(err, "cannot update index cache size")
 	}
+
+	Config.CacheMb = memoryMB
 	return nil
 }
 

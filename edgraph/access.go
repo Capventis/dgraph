@@ -21,7 +21,7 @@ package edgraph
 import (
 	"context"
 
-	"github.com/dgraph-io/dgo/v200/protos/api"
+	"github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/dgraph/gql"
 	"github.com/dgraph-io/dgraph/query"
 	"github.com/dgraph-io/dgraph/x"
@@ -43,6 +43,10 @@ func (s *Server) Login(ctx context.Context,
 
 // ResetAcl is an empty method since ACL is only supported in the enterprise version.
 func ResetAcl(closer *z.Closer) {
+	// do nothing
+}
+
+func upsertGuardianAndGroot(closer *z.Closer, ns uint64) {
 	// do nothing
 }
 
@@ -79,6 +83,10 @@ func AuthorizeGuardians(ctx context.Context) error {
 func AuthGuardianOfTheGalaxy(ctx context.Context) error {
 	// always allow access
 	return nil
+}
+
+func validateToken(jwtStr string) ([]string, error) {
+	return nil, nil
 }
 
 func upsertGuardian(ctx context.Context) error {

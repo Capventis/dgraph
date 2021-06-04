@@ -43,7 +43,9 @@ import (
 	otrace "go.opencensus.io/trace"
 )
 
-var raftDefault = "idx=1; learner=false"
+const (
+	raftDefaults = "idx=1; learner=false;"
+)
 
 type node struct {
 	*conn.Node
@@ -429,7 +431,7 @@ func (n *node) applyProposal(e raftpb.Entry) (uint64, error) {
 		expiry := time.Unix(state.License.ExpiryTs, 0).UTC()
 		state.License.Enabled = time.Now().UTC().Before(expiry)
 		if state.License.Enabled && opts.audit != nil {
-			if err := audit.InitAuditor(opts.audit); err != nil {
+			if err := audit.InitAuditor(opts.audit, 0, n.Id); err != nil {
 				glog.Errorf("error while initializing audit logs %+v", err)
 			}
 		}
@@ -528,6 +530,11 @@ func (n *node) proposeNewCID() {
 	// CID check is needed for the case when a leader assigns a CID to the new node and the new node is proposing a CID
 	for n.server.membershipState().Cid == "" {
 		id := uuid.New().String()
+
+		if zeroCid := Zero.Conf.GetString("cid"); len(zeroCid) > 0 {
+			id = zeroCid
+		}
+
 		err := n.proposeAndWait(context.Background(), &pb.ZeroProposal{Cid: id})
 		if err == nil {
 			glog.Infof("CID set for cluster: %v", id)

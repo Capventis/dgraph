@@ -16,8 +16,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
-	"github.com/dgraph-io/dgo/v200/protos/api"
+	"github.com/dgraph-io/dgo/v210/protos/api"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/query"
 	"github.com/dgraph-io/dgraph/schema"
@@ -109,10 +110,10 @@ func (s *Server) CreateNamespace(ctx context.Context, passwd string) (uint64, er
 		return 0, err
 	}
 
-	if err = worker.WaitForIndexing(ctx, true); err != nil {
-		return 0, errors.Wrap(err, "Creating namespace, got error: ")
-	}
-	if err := createGuardianAndGroot(ctx, ids.StartId, passwd); err != nil {
+	err = x.RetryUntilSuccess(10, 100*time.Millisecond, func() error {
+		return createGuardianAndGroot(ctx, ids.StartId, passwd)
+	})
+	if err != nil {
 		return 0, errors.Wrapf(err, "Failed to create guardian and groot: ")
 	}
 	glog.V(2).Infof("Created namespace: %d", ns)

@@ -18,13 +18,15 @@ package testutil
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"math/rand"
 	"net"
 	"os"
 	"os/exec"
 	"strconv"
+
+	"github.com/dgraph-io/dgraph/x"
+	"github.com/pkg/errors"
 )
 
 type LiveOpts struct {
@@ -33,7 +35,6 @@ type LiveOpts struct {
 	RdfFile    string
 	SchemaFile string
 	Dir        string
-	Ludicrous  bool
 	Env        []string
 	Creds      *LoginParams
 	ForceNs    int64
@@ -46,12 +47,11 @@ func LiveLoad(opts LiveOpts) error {
 		"--schema", opts.SchemaFile,
 		"--alpha", opts.Alpha,
 		"--zero", opts.Zero,
-		"--force-namespace", strconv.FormatInt(opts.ForceNs, 10),
-	}
-	if opts.Ludicrous {
-		args = append(args, "--ludicrous_mode")
 	}
 	if opts.Creds != nil {
+		if opts.Creds.Namespace == x.GalaxyNamespace || opts.ForceNs != 0 {
+			args = append(args, "--force-namespace", strconv.FormatInt(opts.ForceNs, 10))
+		}
 		args = append(args, "--creds")
 		args = append(args, fmt.Sprintf("user=%s;password=%s;namespace=%d",
 			opts.Creds.UserID, opts.Creds.Passwd, opts.Creds.Namespace))
@@ -65,11 +65,11 @@ func LiveLoad(opts LiveOpts) error {
 		liveCmd.Env = append(os.Environ(), opts.Env...)
 	}
 
-	out, err := liveCmd.Output()
+	out, err := liveCmd.CombinedOutput()
 	if err != nil {
 		fmt.Printf("Error %v\n", err)
 		fmt.Printf("Output %v\n", string(out))
-		return err
+		return errors.Wrapf(err, string(out))
 	}
 	if CheckIfRace(out) {
 		return errors.New("race condition detected. check logs for more details")
@@ -85,6 +85,7 @@ type BulkOpts struct {
 	GQLSchemaFile string
 	Dir           string
 	Env           []string
+	Namespace     uint64
 }
 
 func BulkLoad(opts BulkOpts) error {
@@ -97,6 +98,7 @@ func BulkLoad(opts BulkOpts) error {
 		"--map_shards="+strconv.Itoa(opts.Shards),
 		"--store_xids=true",
 		"--zero", opts.Zero,
+		"--force-namespace", strconv.FormatUint(opts.Namespace, 10),
 	)
 
 	if opts.Dir != "" {

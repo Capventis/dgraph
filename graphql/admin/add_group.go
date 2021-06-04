@@ -23,7 +23,7 @@ func NewAddGroupRewriter() resolve.MutationRewriter {
 // AddRewriter.
 func (mrw *addGroupRewriter) RewriteQueries(
 	ctx context.Context,
-	m schema.Mutation) ([]*gql.GraphQuery, error) {
+	m schema.Mutation) ([]*gql.GraphQuery, []string, error) {
 
 	return ((*resolve.AddRewriter)(mrw)).RewriteQueries(ctx, m)
 }
@@ -58,6 +58,13 @@ func (mrw *addGroupRewriter) FromMutationResult(
 	result map[string]interface{}) ([]*gql.GraphQuery, error) {
 
 	return ((*resolve.AddRewriter)(mrw)).FromMutationResult(ctx, mutation, assigned, result)
+}
+
+func (mrw *addGroupRewriter) MutatedRootUIDs(
+	mutation schema.Mutation,
+	assigned map[string]string,
+	result map[string]interface{}) []string {
+	return ((*resolve.AddRewriter)(mrw)).MutatedRootUIDs(mutation, assigned, result)
 }
 
 // removeDuplicateRuleRef removes duplicate rules based on predicate value.

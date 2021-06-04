@@ -20,14 +20,15 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/dgraph-io/badger/v3"
-	"github.com/dgraph-io/dgo/v200"
-	"github.com/dgraph-io/dgraph/ee/enc"
+	"github.com/dgraph-io/dgo/v210"
+	"github.com/dgraph-io/dgraph/ee"
 	"github.com/dgraph-io/dgraph/posting"
 	"github.com/dgraph-io/dgraph/protos/pb"
 	"github.com/dgraph-io/dgraph/types"
@@ -45,12 +46,12 @@ func openDgraph(pdir string) (*badger.DB, error) {
 	// Get key.
 	config := viper.New()
 	flags := &pflag.FlagSet{}
-	enc.RegisterFlags(flags)
+	ee.RegisterEncFlag(flags)
 	if err := config.BindPFlags(flags); err != nil {
 		return nil, err
 	}
-	config.Set("encryption_key_file", KeyFile)
-	k, err := enc.ReadKey(config)
+	config.Set("encryption", ee.BuildEncFlag(KeyFile))
+	keys, err := ee.GetKeys(config)
 	if err != nil {
 		return nil, err
 	}
@@ -58,7 +59,7 @@ func openDgraph(pdir string) (*badger.DB, error) {
 	opt := badger.DefaultOptions(pdir).
 		WithBlockCacheSize(10 * (1 << 20)).
 		WithIndexCacheSize(10 * (1 << 20)).
-		WithEncryptionKey(k).
+		WithEncryptionKey(keys.EncKey).
 		WithNamespaceOffset(x.NamespaceOffset)
 	return badger.OpenManaged(opt)
 }
@@ -93,7 +94,7 @@ func WaitForRestore(t *testing.T, dg *dgo.Dgraph) {
 	   }}`)
 
 		if err == nil {
-			numSuccess += 1
+			numSuccess++
 		} else {
 			require.Contains(t, err.Error(), "the server is in draining mode")
 			numSuccess = 0
@@ -178,8 +179,7 @@ func readSchema(pdir string, dType dataType) ([]string, error) {
 	defer db.Close()
 	values := make([]string, 0)
 
-	// Predicates and types in the schema are written with timestamp 1.
-	txn := db.NewTransactionAt(1, false)
+	txn := db.NewTransactionAt(math.MaxUint64, false)
 	defer txn.Discard()
 	itr := txn.NewIterator(badger.DefaultIteratorOptions)
 	defer itr.Close()

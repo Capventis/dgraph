@@ -27,7 +27,6 @@ import (
 	"strings"
 
 	"github.com/dgraph-io/dgraph/graphql/authorization"
-
 	"github.com/dgraph-io/gqlparser/v2/parser"
 
 	"github.com/dgraph-io/dgraph/x"
@@ -74,6 +73,16 @@ type FieldHTTPConfig struct {
 	GraphqlBatchModeArgument string
 }
 
+// EntityRepresentations is the parsed form of the `representations` argument in `_entities` query
+type EntityRepresentations struct {
+	TypeDefn Type            // the type corresponding to __typename in the representations argument
+	KeyField FieldDefinition // the definition of the @key field
+	KeyVals  []interface{}   // the list of values corresponding to the key field
+	// a map of key field value to the input representation for that value. The keys in this map
+	// are the string formatted version of the key field value.
+	KeyValToRepresentation map[string]map[string]interface{}
+}
+
 // Query/Mutation types and arg names
 const (
 	GetQuery             QueryType    = "get"
@@ -104,6 +113,7 @@ type Schema interface {
 	IsFederated() bool
 	SetMeta(meta *metaInfo)
 	Meta() *metaInfo
+	Type(typeName string) Type
 }
 
 // An Operation is a single valid GraphQL operation.  It contains either
@@ -125,6 +135,7 @@ type Field interface {
 	// DgraphAlias is used as an alias in DQL while rewriting the GraphQL field.
 	DgraphAlias() string
 	ResponseName() string
+	RemoteResponseName() string
 	Arguments() map[string]interface{}
 	ArgValue(name string) interface{}
 	IsArgListType(name string) bool
@@ -140,6 +151,8 @@ type Field interface {
 	//  * seenField: used for skipping when the field has already been seen at the current level
 	SkipField(dgraphTypes []string, seenField map[string]bool) bool
 	Cascade() []string
+	// ApolloRequiredFields returns the fields names which were specified in @requires.
+	ApolloRequiredFields() []string
 	// CustomRequiredFields returns a map from DgraphAlias to the field definition of the fields
 	// which are required to resolve this custom field.
 	CustomRequiredFields() map[string]FieldDefinition
@@ -199,6 +212,7 @@ type Mutation interface {
 	MutatedType() Type
 	QueryField() Field
 	NumUidsField() Field
+	HasLambdaOnMutate() bool
 }
 
 // A Query is a field (from the schema's Query type) from an Operation
@@ -207,9 +221,11 @@ type Query interface {
 	QueryType() QueryType
 	DQLQuery() string
 	Rename(newName string)
-	KeyField(typeName string) (string, bool, error)
-	BuildType(typeName string) Type
+	// RepresentationsArg returns a parsed version of the `representations` argument for `_entities`
+	// query
+	RepresentationsArg() (*EntityRepresentations, error)
 	AuthFor(jwtVars map[string]interface{}) Query
+	Schema() Schema
 }
 
 // A Type is a GraphQL type like: Float, T, T! and [T!]!.  If it's not a list, then
@@ -235,7 +251,7 @@ type Type interface {
 	Interfaces() []string
 	ImplementingTypes() []Type
 	EnsureNonNulls(map[string]interface{}, string) error
-	FieldOriginatedFrom(fieldName string) string
+	FieldOriginatedFrom(fieldName string) (Type, bool)
 	AuthRules() *TypeAuth
 	IsGeo() bool
 	IsAggregateResult() bool
@@ -255,6 +271,7 @@ type FieldDefinition interface {
 	IsID() bool
 	IsExternal() bool
 	HasIDDirective() bool
+	HasInterfaceArg() bool
 	Inverse() FieldDefinition
 	WithMemberType(string) FieldDefinition
 	// TODO - It might be possible to get rid of ForwardEdge and just use Inverse() always.
@@ -292,6 +309,16 @@ type schema struct {
 	// lambdaDirectives stores the mapping of typeName->fieldName->true, if the field has @lambda.
 	// It is read-only.
 	lambdaDirectives map[string]map[string]bool
+	// lambdaOnMutate stores the mapping of mutationName -> true, if the config of @lambdaOnMutate
+	// enables lambdas for that mutation.
+	// It is read-only.
+	lambdaOnMutate map[string]bool
+	// requiresDirectives stores the mapping of typeName->fieldName->list of fields given in
+	// @requires. It is read-only.
+	requiresDirectives map[string]map[string][]string
+	// remoteResponse stores the mapping of typeName->fieldName->responseName which will be used in result
+	// completion step.
+	remoteResponse map[string]map[string]string
 	// Map from typename to auth rules
 	authRules map[string]*TypeAuth
 	// meta is the meta information extracted from input schema
@@ -373,6 +400,17 @@ func (s *schema) SetMeta(meta *metaInfo) {
 
 func (s *schema) Meta() *metaInfo {
 	return s.meta
+}
+
+func (s *schema) Type(typeName string) Type {
+	if s.typeNameAst[typeName] != nil {
+		return &astType{
+			typ:             &ast.Type{NamedType: typeName},
+			inSchema:        s,
+			dgraphPredicate: s.dgraphPredicate,
+		}
+	}
+	return nil
 }
 
 func (o *operation) IsQuery() bool {
@@ -668,7 +706,7 @@ func typeMappings(s *ast.Schema) map[string][]*ast.Definition {
 //	 })
 //	 So, by constructing an appropriate custom directive for @lambda fields,
 //	 we just reuse logic from @custom.
-func customAndLambdaMappings(s *ast.Schema) (map[string]map[string]*ast.Directive,
+func customAndLambdaMappings(s *ast.Schema, ns uint64) (map[string]map[string]*ast.Directive,
 	map[string]map[string]bool) {
 	customDirectives := make(map[string]map[string]*ast.Directive)
 	lambdaDirectives := make(map[string]map[string]bool)
@@ -705,7 +743,7 @@ func customAndLambdaMappings(s *ast.Schema) (map[string]map[string]*ast.Directiv
 						// then, build a custom directive with correct semantics to be put
 						// into custom directives map at this field
 						customFieldMap[field.Name] = buildCustomDirectiveForLambda(typ, field,
-							dir, func(f *ast.FieldDefinition) bool {
+							dir, ns, func(f *ast.FieldDefinition) bool {
 								// Need to skip the fields which have a @custom/@lambda from
 								// going in body template. The field itself may not have the
 								// directive anymore because the directive may have been removed by
@@ -723,6 +761,65 @@ func customAndLambdaMappings(s *ast.Schema) (map[string]map[string]*ast.Directiv
 	}
 
 	return customDirectives, lambdaDirectives
+}
+
+func requiresMappings(s *ast.Schema) map[string]map[string][]string {
+	requiresDirectives := make(map[string]map[string][]string)
+
+	for _, typ := range s.Types {
+		for _, f := range typ.Fields {
+			for i, dir := range f.Directives {
+				if dir.Name != apolloRequiresDirective {
+					continue
+				}
+				lastIndex := len(f.Directives) - 1
+				f.Directives[i] = f.Directives[lastIndex]
+				f.Directives = f.Directives[:lastIndex]
+
+				var fieldMap map[string][]string
+				if existingFieldMap, ok := requiresDirectives[typ.Name]; ok {
+					fieldMap = existingFieldMap
+				} else {
+					fieldMap = make(map[string][]string)
+				}
+
+				fieldMap[f.Name] = strings.Fields(dir.Arguments[0].Value.Raw)
+				requiresDirectives[typ.Name] = fieldMap
+
+				break
+			}
+		}
+	}
+	return requiresDirectives
+}
+
+func remoteResponseMapping(s *ast.Schema) map[string]map[string]string {
+	remoteResponse := make(map[string]map[string]string)
+	for _, typ := range s.Types {
+		for _, field := range typ.Fields {
+			for i, dir := range field.Directives {
+				if dir.Name != remoteResponseDirective {
+					continue
+				}
+				lastIndex := len(field.Directives) - 1
+				field.Directives[i] = field.Directives[lastIndex]
+				field.Directives = field.Directives[:lastIndex]
+
+				var remoteFieldMap map[string]string
+				if existingRemoteFieldMap, ok := remoteResponse[typ.Name]; ok {
+					remoteFieldMap = existingRemoteFieldMap
+				} else {
+					remoteFieldMap = make(map[string]string)
+				}
+
+				remoteFieldMap[field.Name] = dir.Arguments[0].Value.Raw
+				remoteResponse[typ.Name] = remoteFieldMap
+
+				break
+			}
+		}
+	}
+	return remoteResponse
 }
 
 func hasExtends(def *ast.Definition) bool {
@@ -749,8 +846,8 @@ func (m *mutation) IsExternal() bool {
 	return (*field)(m).IsExternal()
 }
 
-func (f *fieldDefinition) IsExternal() bool {
-	return hasExternal(f.fieldDef)
+func (fd *fieldDefinition) IsExternal() bool {
+	return hasExternal(fd.fieldDef)
 }
 
 func hasCustomOrLambda(f *ast.FieldDefinition) bool {
@@ -783,6 +880,12 @@ func nonExternalAndKeyFields(defn *ast.Definition) ast.FieldList {
 	return fldList
 }
 
+// externalAndNonKeyField returns true for those fields which have @external directive and
+// are not @key fields and are not an argument to the @provides directive.
+func externalAndNonKeyField(fld *ast.FieldDefinition, defn *ast.Definition, providesTypeMap map[string]bool) bool {
+	return hasExternal(fld) && !isKeyField(fld, defn) && !providesTypeMap[fld.Name]
+}
+
 // buildCustomDirectiveForLambda returns custom directive for the given field to be used for @lambda
 // The constructed @custom looks like this:
 //	@custom(http: {
@@ -793,7 +896,8 @@ func nonExternalAndKeyFields(defn *ast.Definition) ast.FieldList {
 //	   mode: BATCH (set only if @lambda was on a non query/mutation field)
 //	})
 func buildCustomDirectiveForLambda(defn *ast.Definition, field *ast.FieldDefinition,
-	lambdaDir *ast.Directive, skipInBodyTemplate func(f *ast.FieldDefinition) bool) *ast.Directive {
+	lambdaDir *ast.Directive, ns uint64, skipInBodyTemplate func(f *ast.FieldDefinition) bool) *ast.
+	Directive {
 	comma := ""
 	var bodyTemplate strings.Builder
 
@@ -828,7 +932,7 @@ func buildCustomDirectiveForLambda(defn *ast.Definition, field *ast.FieldDefinit
 
 	// build the children for http argument
 	httpArgChildrens := []*ast.ChildValue{
-		getChildValue(httpUrl, x.Config.GraphqlLambdaUrl, ast.StringValue, lambdaDir.Position),
+		getChildValue(httpUrl, x.LambdaUrl(ns), ast.StringValue, lambdaDir.Position),
 		getChildValue(httpMethod, http.MethodPost, ast.EnumValue, lambdaDir.Position),
 		getChildValue(httpBody, bodyTemplate.String(), ast.StringValue, lambdaDir.Position),
 	}
@@ -861,17 +965,38 @@ func getChildValue(name, raw string, kind ast.ValueKind, position *ast.Position)
 	}
 }
 
+func lambdaOnMutateMappings(s *ast.Schema) map[string]bool {
+	result := make(map[string]bool)
+	for _, typ := range s.Types {
+		dir := typ.Directives.ForName(lambdaOnMutateDirective)
+		if dir == nil {
+			continue
+		}
+
+		for _, arg := range dir.Arguments {
+			value, _ := arg.Value.Value(nil)
+			if val, ok := value.(bool); ok && val {
+				result[arg.Name+typ.Name] = true
+			}
+		}
+	}
+	return result
+}
+
 // AsSchema wraps a github.com/dgraph-io/gqlparser/ast.Schema.
-func AsSchema(s *ast.Schema) (Schema, error) {
-	customDirs, lambdaDirs := customAndLambdaMappings(s)
+func AsSchema(s *ast.Schema, ns uint64) (Schema, error) {
+	customDirs, lambdaDirs := customAndLambdaMappings(s, ns)
 	dgraphPredicate := dgraphMapping(s)
 	sch := &schema{
-		schema:           s,
-		dgraphPredicate:  dgraphPredicate,
-		typeNameAst:      typeMappings(s),
-		customDirectives: customDirs,
-		lambdaDirectives: lambdaDirs,
-		meta:             &metaInfo{}, // initialize with an empty metaInfo
+		schema:             s,
+		dgraphPredicate:    dgraphPredicate,
+		typeNameAst:        typeMappings(s),
+		customDirectives:   customDirs,
+		lambdaDirectives:   lambdaDirs,
+		lambdaOnMutate:     lambdaOnMutateMappings(s),
+		requiresDirectives: requiresMappings(s),
+		remoteResponse:     remoteResponseMapping(s),
+		meta:               &metaInfo{}, // initialize with an empty metaInfo
 	}
 	sch.mutatedType = mutatedTypeMapping(sch, dgraphPredicate)
 	// Auth rules can't be effectively validated as part of the normal rules -
@@ -906,6 +1031,22 @@ func (f *field) DgraphAlias() string {
 
 func (f *field) ResponseName() string {
 	return responseName(f.field)
+}
+
+func remoteResponseDirectiveArgument(fd *ast.FieldDefinition) string {
+	remoteResponseDirectiveDefn := fd.Directives.ForName(remoteResponseDirective)
+	if remoteResponseDirectiveDefn != nil {
+		return remoteResponseDirectiveDefn.Arguments.ForName("name").Value.Raw
+	}
+	return ""
+}
+
+func (f *field) RemoteResponseName() string {
+	remoteResponse := f.op.inSchema.remoteResponse[f.GetObjectName()][f.Name()]
+	if remoteResponse == "" {
+		return f.Name()
+	}
+	return remoteResponse
 }
 
 func (f *field) SetArgTo(arg string, val interface{}) {
@@ -1084,19 +1225,20 @@ func (f *field) Cascade() []string {
 	if dir == nil {
 		return nil
 	}
-	arg := dir.Arguments.ForName(cascadeArg)
-	if arg == nil || arg.Value == nil || len(arg.Value.Children) == 0 {
+	fieldsVal, _ := dir.ArgumentMap(f.op.vars)[cascadeArg].([]interface{})
+	if len(fieldsVal) == 0 {
 		return []string{"__all__"}
 	}
-	fields := make([]string, 0, len(arg.Value.Children))
+
+	fields := make([]string, 0)
 	typ := f.Type()
 	idField := typ.IDField()
 
-	for _, child := range arg.Value.Children {
-		if idField != nil && idField.Name() == child.Value.Raw {
+	for _, value := range fieldsVal {
+		if idField != nil && idField.Name() == value {
 			fields = append(fields, "uid")
 		} else {
-			fields = append(fields, typ.DgraphPredicate(child.Value.Raw))
+			fields = append(fields, typ.DgraphPredicate(value.(string)))
 		}
 
 	}
@@ -1115,6 +1257,10 @@ func toRequiredFieldDefs(requiredFieldNames map[string]bool, sibling *field) map
 		res[fieldDef.DgraphAlias()] = fieldDef
 	}
 	return res
+}
+
+func (f *field) ApolloRequiredFields() []string {
+	return f.op.inSchema.requiresDirectives[f.GetObjectName()][f.Name()]
 }
 
 func (f *field) CustomRequiredFields() map[string]FieldDefinition {
@@ -1264,8 +1410,6 @@ func (f *field) IDArgValue() (xids map[string]string, uid uint64, err error) {
 			switch v := f.ArgValue(xidArgName).(type) {
 			case int64:
 				xidArgVal = strconv.FormatInt(v, 10)
-			case float64:
-				xidArgVal = strconv.FormatFloat(v, 'f', -1, 64)
 			case string:
 				xidArgVal = v
 			default:
@@ -1298,16 +1442,6 @@ func (f *field) IDArgValue() (xids map[string]string, uid uint64, err error) {
 	}
 
 	return
-}
-
-func (q *query) BuildType(typeName string) Type {
-	t := &ast.Type{}
-	t.NamedType = typeName
-	return &astType{
-		typ:             t,
-		inSchema:        q.op.inSchema,
-		dgraphPredicate: q.op.inSchema.dgraphPredicate,
-	}
 }
 
 func (f *field) Type() Type {
@@ -1581,6 +1715,74 @@ func (q *query) GetAuthMeta() *authorization.AuthMeta {
 	return (*field)(q).GetAuthMeta()
 }
 
+func (q *query) RepresentationsArg() (*EntityRepresentations, error) {
+	representations, ok := q.ArgValue("representations").([]interface{})
+	if !ok {
+		return nil, fmt.Errorf("error parsing `representations` argument")
+	}
+	if len(representations) == 0 {
+		return nil, fmt.Errorf("expecting at least one item in `representations` argument")
+	}
+	representation, ok := representations[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("error parsing %dth item in the `_representations` argument", 0)
+	}
+	typename, ok := representation[Typename].(string)
+	if !ok {
+		return nil, fmt.Errorf("unable to extract __typename from %dth item in the"+
+			" `_representations` argument", 0)
+	}
+	typ := q.op.inSchema.schema.Types[typename]
+	if typ == nil {
+		return nil, fmt.Errorf("type %s not found in the schema", typename)
+	}
+	keyDir := typ.Directives.ForName(apolloKeyDirective)
+	if keyDir == nil {
+		return nil, fmt.Errorf("type %s doesn't have a key Directive", typename)
+	}
+	keyFldName := keyDir.Arguments[0].Value.Raw
+
+	// initialize the struct to return
+	entityReprs := &EntityRepresentations{
+		TypeDefn: &astType{
+			typ:             &ast.Type{NamedType: typename},
+			inSchema:        q.op.inSchema,
+			dgraphPredicate: q.op.inSchema.dgraphPredicate,
+		},
+		KeyVals:                make([]interface{}, 0, len(representations)),
+		KeyValToRepresentation: make(map[string]map[string]interface{}),
+	}
+	entityReprs.KeyField = entityReprs.TypeDefn.Field(keyFldName)
+
+	// iterate over all the representations and parse
+	for i, rep := range representations {
+		representation, ok = rep.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("error parsing %dth item in the `_representations` argument", i)
+		}
+
+		typename, ok = representation[Typename].(string)
+		if !ok {
+			return nil, fmt.Errorf("unable to extract __typename from %dth item in the"+
+				" `_representations` argument", i)
+		}
+		if typename != entityReprs.TypeDefn.Name() {
+			return nil, fmt.Errorf("expected only one unique typename in `_representations`"+
+				" argument, got: [%s, %s]", entityReprs.TypeDefn.Name(), typename)
+		}
+
+		keyVal, ok := representation[keyFldName]
+		if !ok {
+			return nil, fmt.Errorf("unable to extract value for key field `%s` from %dth item in"+
+				" the `_representations` argument", keyFldName, i)
+		}
+		entityReprs.KeyVals = append(entityReprs.KeyVals, keyVal)
+		entityReprs.KeyValToRepresentation[fmt.Sprint(keyVal)] = representation
+	}
+
+	return entityReprs, nil
+}
+
 func (q *query) AuthFor(jwtVars map[string]interface{}) Query {
 	// copy the template, so that multiple queries can run rewriting for the rule.
 	return &query{
@@ -1598,8 +1800,16 @@ func (q *query) Rename(newName string) {
 	q.field.Name = newName
 }
 
+func (q *query) Schema() Schema {
+	return q.op.inSchema
+}
+
 func (q *query) Name() string {
 	return (*field)(q).Name()
+}
+
+func (q *query) RemoteResponseName() string {
+	return (*field)(q).RemoteResponseName()
 }
 
 func (q *query) Alias() string {
@@ -1640,6 +1850,10 @@ func (q *query) SkipField(dgraphTypes []string, seenField map[string]bool) bool 
 
 func (q *query) Cascade() []string {
 	return (*field)(q).Cascade()
+}
+
+func (q *query) ApolloRequiredFields() []string {
+	return (*field)(q).ApolloRequiredFields()
 }
 
 func (q *query) CustomRequiredFields() map[string]FieldDefinition {
@@ -1692,20 +1906,6 @@ func (q *query) CustomHTTPConfig() (*FieldHTTPConfig, error) {
 
 func (q *query) EnumValues() []string {
 	return nil
-}
-
-func (q *query) KeyField(typeName string) (string, bool, error) {
-	typ := q.op.inSchema.schema.Types[typeName]
-	if typ == nil {
-		return "", false, fmt.Errorf("Type %s not found in the schema", typeName)
-	}
-	keyDir := typ.Directives.ForName(apolloKeyDirective)
-	if keyDir == nil {
-		return "", false, fmt.Errorf("Type %s  doesn't have a key Directive", typeName)
-	}
-	fldName := keyDir.Arguments[0].Value.Raw
-	fldType := typ.Fields.ForName(fldName).Type
-	return fldName, fldType.Name() == IDType, nil
 }
 
 func (m *mutation) ConstructedFor() Type {
@@ -1869,6 +2069,10 @@ func (m *mutation) Name() string {
 	return (*field)(m).Name()
 }
 
+func (m *mutation) RemoteResponseName() string {
+	return (*field)(m).RemoteResponseName()
+}
+
 func (m *mutation) Alias() string {
 	return (*field)(m).Alias()
 }
@@ -1907,6 +2111,10 @@ func (m *mutation) SkipField(dgraphTypes []string, seenField map[string]bool) bo
 
 func (m *mutation) Cascade() []string {
 	return (*field)(m).Cascade()
+}
+
+func (m *mutation) ApolloRequiredFields() []string {
+	return (*field)(m).ApolloRequiredFields()
 }
 
 func (m *mutation) CustomRequiredFields() map[string]FieldDefinition {
@@ -1954,7 +2162,7 @@ func (m *mutation) QueryField() Field {
 		// gets executed to fetch the results of that mutation, so propagating it to the QueryField.
 		if len(m.Cascade()) != 0 && len(f.Cascade()) == 0 {
 			field := f.(*field).field
-			field.Directives = append(field.Directives, &ast.Directive{Name: cascadeDirective})
+			field.Directives = append(field.Directives, &ast.Directive{Name: cascadeDirective, Definition: m.op.inSchema.schema.Directives[cascadeDirective]})
 		}
 		return f
 	}
@@ -1968,6 +2176,10 @@ func (m *mutation) NumUidsField() Field {
 		}
 	}
 	return nil
+}
+
+func (m *mutation) HasLambdaOnMutate() bool {
+	return m.op.inSchema.lambdaOnMutate[m.Name()]
 }
 
 func (m *mutation) Location() x.Location {
@@ -2133,8 +2345,32 @@ func (fd *fieldDefinition) HasIDDirective() bool {
 }
 
 func hasIDDirective(fd *ast.FieldDefinition) bool {
-	id := fd.Directives.ForName("id")
+	id := fd.Directives.ForName(idDirective)
 	return id != nil
+}
+
+func (fd *fieldDefinition) HasInterfaceArg() bool {
+	if fd.fieldDef == nil {
+		return false
+	}
+	return hasInterfaceArg(fd.fieldDef)
+}
+
+func hasInterfaceArg(fd *ast.FieldDefinition) bool {
+	if !hasIDDirective(fd) {
+		return false
+	}
+	interfaceArg := fd.Directives.ForName(idDirective).Arguments.ForName(idDirectiveInterfaceArg)
+	if interfaceArg == nil {
+		return false
+	}
+
+	value, _ := interfaceArg.Value.Value(nil)
+	if val, ok := value.(bool); ok && val {
+		return true
+	}
+
+	return false
 }
 
 func isID(fd *ast.FieldDefinition) bool {
@@ -2142,6 +2378,9 @@ func isID(fd *ast.FieldDefinition) bool {
 }
 
 func (fd *fieldDefinition) Type() Type {
+	if fd.fieldDef == nil {
+		return nil
+	}
 	return &astType{
 		typ:             fd.fieldDef.Type,
 		inSchema:        fd.inSchema,
@@ -2823,21 +3062,34 @@ func SubstituteVarsInBody(jsonTemplate interface{}, variables map[string]interfa
 	return jsonTemplate
 }
 
-// FieldOriginatedFrom returns the name of the interface from which given field was inherited.
-// If the field wasn't inherited, but belonged to this type, this type's name is returned.
-// Otherwise, empty string is returned.
-func (t *astType) FieldOriginatedFrom(fieldName string) string {
+// FieldOriginatedFrom returns the interface from which given field was inherited.
+// If the field wasn't inherited, but belonged to this type,then type is returned.
+// Otherwise, nil is returned. Along with type definition we return boolean flag true if field
+// is inherited from interface.
+func (t *astType) FieldOriginatedFrom(fieldName string) (Type, bool) {
+
+	astTyp := &astType{
+		inSchema:        t.inSchema,
+		dgraphPredicate: t.dgraphPredicate,
+	}
+
 	for _, implements := range t.inSchema.schema.Implements[t.Name()] {
 		if implements.Fields.ForName(fieldName) != nil {
-			return implements.Name
+			astTyp.typ = &ast.Type{
+				NamedType: implements.Name,
+			}
+			return astTyp, true
 		}
 	}
 
 	if t.inSchema.schema.Types[t.Name()].Fields.ForName(fieldName) != nil {
-		return t.Name()
+		astTyp.typ = &ast.Type{
+			NamedType: t.inSchema.schema.Types[t.Name()].Name,
+		}
+		return astTyp, false
 	}
 
-	return ""
+	return nil, false
 }
 
 // buildGraphqlRequestFields will build graphql request body from ast.
@@ -2902,4 +3154,19 @@ func parseRequiredArgsFromGQLRequest(req string) (map[string]bool, error) {
 	args := req[strings.Index(req, "(")+1 : strings.LastIndex(req, ")")]
 	_, rf, err := parseBodyTemplate("{"+args+"}", false)
 	return rf, err
+}
+
+// MaybeQuoteArg puts a quote on the function arguments.
+func MaybeQuoteArg(fn string, arg interface{}) string {
+	switch arg := arg.(type) {
+	case string: // dateTime also parsed as string
+		if fn == "regexp" {
+			return arg
+		}
+		return fmt.Sprintf("%q", arg)
+	case float64, float32:
+		return fmt.Sprintf("\"%v\"", arg)
+	default:
+		return fmt.Sprintf("%v", arg)
+	}
 }

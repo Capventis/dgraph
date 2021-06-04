@@ -108,7 +108,7 @@ func command(args ...string) *exec.Cmd {
 func startCluster(composeFile, prefix string) error {
 	cmd := command(
 		"docker-compose", "-f", composeFile, "-p", prefix,
-		"up", "--force-recreate", "--remove-orphans", "--detach")
+		"up", "--force-recreate", "--build", "--remove-orphans", "--detach")
 	cmd.Stderr = nil
 
 	fmt.Printf("Bringing up cluster %s for package: %s ...\n", prefix, composeFile)
@@ -145,8 +145,40 @@ func detectRace(prefix string) bool {
 	return zeroRaceDetected || alphaRaceDetected
 }
 
-func stopCluster(composeFile, prefix string, wg *sync.WaitGroup) {
+func outputLogs(prefix string) {
+	f, err := ioutil.TempFile(".", prefix+"*.log")
+	x.Check(err)
+	printLogs := func(container string) {
+		in := testutil.GetContainerInstance(prefix, container)
+		c := in.GetContainer()
+		if c == nil {
+			return
+		}
+		logCmd := exec.Command("docker", "logs", c.ID)
+		out, err := logCmd.CombinedOutput()
+		x.Check(err)
+		f.Write(out)
+		// fmt.Printf("Docker logs for %s is %s with error %+v ", c.ID, string(out), err)
+	}
+	for i := 0; i <= 3; i++ {
+		printLogs("zero" + strconv.Itoa(i))
+	}
+
+	for i := 0; i <= 6; i++ {
+		printLogs("alpha" + strconv.Itoa(i))
+	}
+	f.Sync()
+	f.Close()
+	s := fmt.Sprintf("---> LOGS for %s written to %s .\n", prefix, f.Name())
+	_, err = oc.Write([]byte(s))
+	x.Check(err)
+}
+
+func stopCluster(composeFile, prefix string, wg *sync.WaitGroup, err error) {
 	go func() {
+		if err != nil {
+			outputLogs(prefix)
+		}
 		cmd := command("docker-compose", "-f", composeFile, "-p", prefix, "down", "-v")
 		cmd.Stderr = nil
 		if err := cmd.Run(); err != nil {
@@ -232,6 +264,7 @@ func hasTestFiles(pkg string) bool {
 var _threadId int32
 
 func runTests(taskCh chan task, closer *z.Closer) error {
+	var err error
 	threadId := atomic.AddInt32(&_threadId, 1)
 
 	{
@@ -267,7 +300,7 @@ func runTests(taskCh chan task, closer *z.Closer) error {
 			return
 		}
 		wg.Add(1)
-		stopCluster(defaultCompose, prefix, wg)
+		stopCluster(defaultCompose, prefix, wg, err)
 		stopped = true
 	}
 	defer stop()
@@ -277,7 +310,8 @@ func runTests(taskCh chan task, closer *z.Closer) error {
 
 	for task := range taskCh {
 		if ctx.Err() != nil {
-			return ctx.Err()
+			err = ctx.Err()
+			return err
 		}
 		if !hasTestFiles(task.pkg.ID) {
 			continue
@@ -289,16 +323,19 @@ func runTests(taskCh chan task, closer *z.Closer) error {
 				continue
 			}
 			start()
-			if err := runTestsFor(ctx, task.pkg.ID, prefix); err != nil {
+			if err = runTestsFor(ctx, task.pkg.ID, prefix); err != nil {
+				// fmt.Printf("ERROR for package: %s. Err: %v\n", task.pkg.ID, err)
 				return err
 			}
 		} else {
-			if err := runCustomClusterTest(ctx, task.pkg.ID, wg); err != nil {
-				return err
+			// we are not using err variable here because we dont want to
+			// print logs of default cluster in case of custom test fail.
+			if cerr := runCustomClusterTest(ctx, task.pkg.ID, wg); cerr != nil {
+				return cerr
 			}
 		}
 	}
-	return nil
+	return err
 }
 
 func getGlobalPrefix() string {
@@ -319,19 +356,20 @@ func getClusterPrefix() string {
 
 func runCustomClusterTest(ctx context.Context, pkg string, wg *sync.WaitGroup) error {
 	fmt.Printf("Bringing up cluster for package: %s\n", pkg)
-
+	var err error
 	compose := composeFileFor(pkg)
 	prefix := getClusterPrefix()
-	err := startCluster(compose, prefix)
+	err = startCluster(compose, prefix)
 	if err != nil {
 		return err
 	}
 	if !*keepCluster {
 		wg.Add(1)
-		defer stopCluster(compose, prefix, wg)
+		defer stopCluster(compose, prefix, wg, err)
 	}
 
-	return runTestsFor(ctx, pkg, prefix)
+	err = runTestsFor(ctx, pkg, prefix)
+	return err
 }
 
 func findPackagesFor(testName string) []string {
@@ -559,7 +597,6 @@ func removeAllTestContainers() {
 
 var loadPackages = []string{
 	"/systest/21million/bulk",
-	"/systest/21million/ludicrous",
 	"/systest/21million/live",
 	"/systest/1million",
 	"/systest/bulk_live/bulk",

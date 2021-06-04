@@ -5,7 +5,7 @@
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *	 http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -18,10 +18,12 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math"
 	"os"
 	"os/user"
+	"path"
 	"strconv"
 	"strings"
 
@@ -88,6 +90,7 @@ type options struct {
 	Acl            bool
 	AclSecret      string
 	DataDir        string
+	PDir           string
 	DataVol        bool
 	TmpFS          bool
 	UserOwnership  bool
@@ -101,13 +104,9 @@ type options struct {
 	Image          string
 	Tag            string
 	WhiteList      bool
-	Ratel          bool
-	RatelPort      int
 	MemLimit       string
-	TlsDir         string
 	ExposePorts    bool
 	Encryption     bool
-	LudicrousMode  bool
 	SnapshotAfter  string
 	ContainerNames bool
 	AlphaVolumes   []string
@@ -118,6 +117,15 @@ type options struct {
 	MinioDataDir   string
 	MinioPort      uint16
 	MinioEnvFile   []string
+	Hostname       string
+	Cdc            bool
+	CdcConsumer    bool
+
+	// Alpha Configurations
+	CustomAlphaOptions []string
+
+	// Container Alias
+	ContainerPrefix string
 
 	// Extra flags
 	AlphaFlags string
@@ -159,10 +167,20 @@ func getOffset(idx int) int {
 	return idx
 }
 
+func getHost(host string) string {
+	if opts.Hostname != "" {
+		return opts.Hostname
+	}
+	return host
+}
+
 func initService(basename string, idx, grpcPort int) service {
 	var svc service
-
-	svc.name = name(basename, idx)
+	containerPrefix := basename
+	if opts.ContainerPrefix != "" {
+		containerPrefix = opts.ContainerPrefix + "_" + basename
+	}
+	svc.name = name(containerPrefix, idx)
 	svc.Image = opts.Image + ":" + opts.Tag
 	svc.ContainerName = containerName(svc.name)
 	svc.WorkingDir = fmt.Sprintf("/data/%s", svc.name)
@@ -176,12 +194,18 @@ func initService(basename string, idx, grpcPort int) service {
 		toPort(grpcPort + 1000), // http port
 	}
 
-	svc.Volumes = append(svc.Volumes, volume{
-		Type:     "bind",
-		Source:   "$GOPATH/bin",
-		Target:   "/gobin",
-		ReadOnly: true,
-	})
+	// If hostname is specified then expose the internal grpc port (7080) of alpha.
+	if basename == "alpha" && opts.Hostname != "" {
+		svc.Ports = append(svc.Ports, toPort(grpcPort-1000))
+	}
+	if opts.LocalBin {
+		svc.Volumes = append(svc.Volumes, volume{
+			Type:     "bind",
+			Source:   "$GOPATH/bin",
+			Target:   "/gobin",
+			ReadOnly: true,
+		})
+	}
 
 	switch {
 	case opts.DataVol:
@@ -215,7 +239,7 @@ func initService(basename string, idx, grpcPort int) service {
 	}
 	svc.Command += " " + basename
 	if opts.Jaeger {
-		svc.Command += " --jaeger.collector=http://jaeger:14268"
+		svc.Command += ` --trace "jaeger=http://jaeger:14268;"`
 	}
 	return svc
 }
@@ -236,7 +260,7 @@ func getZero(idx int, raft string) service {
 		svc.Command += fmt.Sprintf(" -o %d", opts.PortOffset+offset)
 	}
 	svc.Command += fmt.Sprintf(" --raft='%s'", raft)
-	svc.Command += fmt.Sprintf(" --my=%s:%d", svc.name, grpcPort)
+	svc.Command += fmt.Sprintf(" --my=%s:%d", getHost(svc.name), grpcPort)
 	if opts.NumAlphas > 1 {
 		svc.Command += fmt.Sprintf(" --replicas=%d", opts.NumReplicas)
 	}
@@ -247,7 +271,8 @@ func getZero(idx int, raft string) service {
 	if idx == 1 {
 		svc.Command += fmt.Sprintf(" --bindall")
 	} else {
-		svc.Command += fmt.Sprintf(" --peer=%s:%d", name(basename, 1), basePort)
+		peerHost := name(basename, 1)
+		svc.Command += fmt.Sprintf(" --peer=%s:%d", getHost(peerHost), basePort)
 	}
 	if len(opts.MemLimit) > 0 {
 		svc.Deploy.Resources = res{
@@ -268,7 +293,7 @@ func getZero(idx int, raft string) service {
 	return svc
 }
 
-func getAlpha(idx int, raft string) service {
+func getAlpha(idx int, raft string, customFlags string) service {
 	basename := "alpha"
 	internalPort := alphaBasePort + opts.PortOffset + getOffset(idx)
 	grpcPort := internalPort + 1000
@@ -291,10 +316,17 @@ func getAlpha(idx int, raft string) service {
 		maxZeros = opts.NumZeros
 	}
 
-	zeroHostAddr := fmt.Sprintf("zero%d:%d", 1, zeroBasePort+opts.PortOffset)
+	zeroName := "zero"
+	if opts.ContainerPrefix != "" {
+		zeroName = opts.ContainerPrefix + "_" + zeroName
+	}
+
+	zeroHostAddr := fmt.Sprintf("%s:%d", getHost(zeroName+"1"), zeroBasePort+opts.PortOffset)
 	zeros := []string{zeroHostAddr}
 	for i := 2; i <= maxZeros; i++ {
-		zeroHostAddr = fmt.Sprintf("zero%d:%d", i, zeroBasePort+opts.PortOffset+getOffset(i))
+		port := zeroBasePort + opts.PortOffset + getOffset(i)
+		zeroHost := fmt.Sprintf("%s%d", zeroName, i)
+		zeroHostAddr = fmt.Sprintf("%s:%d", getHost(zeroHost), port)
 		zeros = append(zeros, zeroHostAddr)
 	}
 
@@ -304,17 +336,15 @@ func getAlpha(idx int, raft string) service {
 	if (opts.PortOffset + offset) != 0 {
 		svc.Command += fmt.Sprintf(" -o %d", opts.PortOffset+offset)
 	}
-	svc.Command += fmt.Sprintf(" --my=%s:%d", svc.name, internalPort)
+	svc.Command += fmt.Sprintf(" --my=%s:%d", getHost(svc.name), internalPort)
 	svc.Command += fmt.Sprintf(" --zero=%s", zerosOpt)
 	svc.Command += fmt.Sprintf(" --logtostderr -v=%d", opts.Verbosity)
-	if opts.LudicrousMode {
-		svc.Command += " --ludicrous_mode=true"
-	}
+	svc.Command += " --expose_trace=true"
 
 	if opts.SnapshotAfter != "" {
-		raft = fmt.Sprintf("%s; snapshot-after=%s", raft, opts.SnapshotAfter)
+		raft = fmt.Sprintf("%s; %s", raft, opts.SnapshotAfter)
 	}
-	svc.Command += fmt.Sprintf(` --raft='%s'`, raft)
+	svc.Command += fmt.Sprintf(` --raft "%s"`, raft)
 
 	// Don't assign idx, let it auto-assign.
 	// svc.Command += fmt.Sprintf(" --raft='idx=%d'", idx)
@@ -322,10 +352,10 @@ func getAlpha(idx int, raft string) service {
 		svc.Command += fmt.Sprintf(" --vmodule=%s", opts.Vmodule)
 	}
 	if opts.WhiteList {
-		svc.Command += " --whitelist=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+		svc.Command += ` --security "whitelist=10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,100.0.0.0/8;"`
 	}
 	if opts.Acl {
-		svc.Command += " --acl_secret_file=/secret/hmac"
+		svc.Command += ` --acl "secret-file=/secret/hmac;"`
 		svc.Volumes = append(svc.Volumes, volume{
 			Type:     "bind",
 			Source:   "./acl-secret",
@@ -334,7 +364,7 @@ func getAlpha(idx int, raft string) service {
 		})
 	}
 	if opts.AclSecret != "" {
-		svc.Command += " --acl_secret_file=/secret/hmac"
+		svc.Command += ` --acl "secret-file=/secret/hmac;"`
 		svc.Volumes = append(svc.Volumes, volume{
 			Type:     "bind",
 			Source:   opts.AclSecret,
@@ -348,7 +378,7 @@ func getAlpha(idx int, raft string) service {
 		}
 	}
 	if opts.Encryption {
-		svc.Command += " --encryption_key_file=/secret/enc_key"
+		svc.Command += ` --encryption "key-file=/secret/enc_key;"`
 		svc.Volumes = append(svc.Volumes, volume{
 			Type:     "bind",
 			Source:   "./enc-secret",
@@ -356,14 +386,8 @@ func getAlpha(idx int, raft string) service {
 			ReadOnly: true,
 		})
 	}
-	if opts.TlsDir != "" {
-		svc.Command += " --tls_dir=/secret/tls"
-		svc.Volumes = append(svc.Volumes, volume{
-			Type:     "bind",
-			Source:   opts.TlsDir,
-			Target:   "/secret/tls",
-			ReadOnly: true,
-		})
+	if opts.Cdc {
+		svc.Command += " --cdc='kafka=kafka:9092'"
 	}
 	if len(opts.AlphaVolumes) > 0 {
 		for _, vol := range opts.AlphaVolumes {
@@ -373,6 +397,10 @@ func getAlpha(idx int, raft string) service {
 	svc.EnvFile = opts.AlphaEnvFile
 	if opts.AlphaFlags != "" {
 		svc.Command += " " + opts.AlphaFlags
+	}
+
+	if customFlags != "" {
+		svc.Command += " " + customFlags
 	}
 
 	return svc
@@ -406,11 +434,14 @@ func getJaeger() service {
 			toPort(16686),
 		},
 		Environment: []string{
-			"SPAN_STORAGE_TYPE=badger",
+			"SPAN_STORAGE_TYPE=memory",
+			// "SPAN_STORAGE_TYPE=badger",
+			// Note: Badger doesn't quite work as well in Jaeger. The integration isn't well
+			// written.
 		},
-		Command: "--badger.ephemeral=false" +
-			" --badger.directory-key /working/jaeger" +
-			" --badger.directory-value /working/jaeger",
+		// Command: "--badger.ephemeral=false" +
+		// 	" --badger.directory-key /working/jaeger" +
+		// 	" --badger.directory-value /working/jaeger",
 	}
 	return svc
 }
@@ -432,22 +463,6 @@ func getMinio(minioDataDir string) service {
 			Source: minioDataDir,
 			Target: "/data/minio",
 		})
-	}
-	return svc
-}
-
-func getRatel() service {
-	portFlag := ""
-	if opts.RatelPort != 8000 {
-		portFlag = fmt.Sprintf(" -port=%d", opts.RatelPort)
-	}
-	svc := service{
-		Image:         opts.Image + ":" + opts.Tag,
-		ContainerName: containerName("ratel"),
-		Ports: []string{
-			toPort(opts.RatelPort),
-		},
-		Command: "dgraph-ratel" + portFlag,
 	}
 	return svc
 }
@@ -511,6 +526,32 @@ func addMetrics(cfg *composeConfig) {
 	}
 }
 
+func addCdc(cfg *composeConfig) {
+	cfg.Services["zookeeper"] = service{
+		Image:         "bitnami/zookeeper:3.7.0",
+		ContainerName: containerName("zookeeper"),
+		Environment: []string{
+			"ALLOW_ANONYMOUS_LOGIN=yes",
+		},
+	}
+	cfg.Services["kafka"] = service{
+		Image:         "bitnami/kafka:2.7.0",
+		ContainerName: containerName("kafka"),
+		Environment: []string{
+			"ALLOW_PLAINTEXT_LISTENER=yes",
+			"KAFKA_BROKER_ID=1",
+			"KAFKA_CFG_ZOOKEEPER_CONNECT=zookeeper:2181",
+		},
+	}
+	if opts.CdcConsumer {
+		cfg.Services["kafka-consumer"] = service{
+			Image:         "bitnami/kafka:2.7.0",
+			ContainerName: containerName("kafka-consumer"),
+			Command:       "kafka-console-consumer.sh --bootstrap-server kafka:9092 --topic dgraph-cdc",
+		}
+	}
+}
+
 func semverCompare(constraint, version string) (bool, error) {
 	c, err := sv.NewConstraint(constraint)
 	if err != nil {
@@ -532,6 +573,88 @@ func isBindMount(vol string) bool {
 func fatal(err error) {
 	fmt.Fprintf(os.Stderr, "compose: %v\n", err)
 	os.Exit(1)
+}
+
+func makeDir(path string) error {
+	var err1 error
+	_, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		if errs := os.MkdirAll(path, 0755); errs != nil {
+			err1 = errors.Wrapf(err, "Couldn't create directory %v.", path)
+		}
+	} else if err != nil {
+		err1 = errors.Wrapf(err, "Something went wrong while checking if directory %v still exists.",
+			path)
+	}
+	return err1
+}
+
+func copyFile(src, dst string) error {
+	var err, err1 error
+	var srcfd *os.File
+	var dstfd *os.File
+	var srcInfo os.FileInfo
+
+	if srcfd, err = os.Open(src); err != nil {
+		err1 = errors.Wrapf(err, "Error in opening source file %v.", src)
+		return err1
+	}
+	defer srcfd.Close()
+
+	if dstfd, err = os.Create(dst); err != nil {
+		err1 = errors.Wrapf(err, "Error in creating destination file %v.", dst)
+		return err1
+	}
+	defer dstfd.Close()
+
+	if _, err = io.Copy(dstfd, srcfd); err != nil {
+		err1 = errors.Wrapf(err, "Error in copying source file %v to destination file %v.",
+			src, dst)
+		return err1
+	}
+	if srcInfo, err = os.Stat(src); err != nil {
+		err1 = errors.Wrapf(err, "Error in doing stat of source file %v.", src)
+		return err1
+	}
+	return os.Chmod(dst, srcInfo.Mode())
+}
+
+func copyDir(src string, dst string) error {
+	var err, err1 error
+	var fds []os.FileInfo
+	var srcInfo os.FileInfo
+
+	if srcInfo, err = os.Stat(src); err != nil {
+		err1 = errors.Wrapf(err, "Error in doing stat of source dir %v.", src)
+		return err1
+	}
+
+	if err = os.MkdirAll(dst, srcInfo.Mode()); err != nil {
+		err1 = errors.Wrapf(err, "Error in making dir %v.", dst)
+		return err1
+	}
+
+	if fds, err = ioutil.ReadDir(src); err != nil {
+		err1 = errors.Wrapf(err, "Error in reading source dir %v.", src)
+		return err1
+	}
+	for _, fd := range fds {
+		srcfp := path.Join(src, fd.Name())
+		dstfp := path.Join(dst, fd.Name())
+
+		if fd.IsDir() {
+			if err = copyDir(srcfp, dstfp); err != nil {
+				err1 = errors.Wrapf(err, "Could not copy dir %v to %v.", srcfp, dstfp)
+				return err1
+			}
+		} else {
+			if err = copyFile(srcfp, dstfp); err != nil {
+				err1 = errors.Wrapf(err, "Could not copy file %v to %v.", srcfp, dstfp)
+				return err1
+			}
+		}
+	}
+	return nil
 }
 
 func main() {
@@ -557,6 +680,12 @@ func main() {
 		"mount a docker volume as /data in containers")
 	cmd.PersistentFlags().StringVarP(&opts.DataDir, "data_dir", "d", "",
 		"mount a host directory as /data in containers")
+	cmd.PersistentFlags().StringVarP(&opts.PDir, "postings", "p", "",
+		"launch cluster with local path of p directory, data_vol must be set to true and a=r."+
+			"\nFor new cluster to pick postings, you might have to move uids and timestamp..."+
+			"\ncurl \"http://localhost:<zeroPort>/assign?what=timestamps&num=1000000\""+
+			"\ncurl \"http://localhost:<zeroPort>/assign?what=uids&num=1000000\"")
+
 	cmd.PersistentFlags().BoolVar(&opts.Acl, "acl", false, "Create ACL secret file and enable ACLs")
 	cmd.PersistentFlags().StringVar(&opts.AclSecret, "acl_secret", "",
 		"enable ACL feature with specified HMAC secret file")
@@ -568,8 +697,8 @@ func main() {
 		"include jaeger service")
 	cmd.PersistentFlags().BoolVarP(&opts.Metrics, "metrics", "m", false,
 		"include metrics (prometheus, grafana) services")
-	cmd.PersistentFlags().IntVarP(&opts.PortOffset, "port_offset", "o", 100,
-		"port offset for alpha and, if not 100, zero as well")
+	cmd.PersistentFlags().IntVarP(&opts.PortOffset, "port_offset", "o", 0,
+		"port offset for alpha and zero")
 	cmd.PersistentFlags().IntVarP(&opts.Verbosity, "verbosity", "v", 2,
 		"glog verbosity level")
 	cmd.PersistentFlags().StringVarP(&opts.OutFile, "out", "O",
@@ -582,22 +711,14 @@ func main() {
 		"Docker tag for the --image image. Requires -l=false to use binary from docker container.")
 	cmd.PersistentFlags().BoolVarP(&opts.WhiteList, "whitelist", "w", true,
 		"include a whitelist if true")
-	cmd.PersistentFlags().BoolVar(&opts.Ratel, "ratel", false,
-		"include ratel service")
-	cmd.PersistentFlags().IntVar(&opts.RatelPort, "ratel_port", 8000,
-		"Port to expose Ratel service")
 	cmd.PersistentFlags().StringVarP(&opts.MemLimit, "mem", "", "32G",
 		"Limit memory provided to the docker containers, for example 8G.")
-	cmd.PersistentFlags().StringVar(&opts.TlsDir, "tls_dir", "",
-		"TLS Dir.")
 	cmd.PersistentFlags().BoolVar(&opts.ExposePorts, "expose_ports", true,
 		"expose host:container ports for each service")
 	cmd.PersistentFlags().StringVar(&opts.Vmodule, "vmodule", "",
 		"comma-separated list of pattern=N settings for file-filtered logging")
 	cmd.PersistentFlags().BoolVar(&opts.Encryption, "encryption", false,
 		"enable encryption-at-rest feature.")
-	cmd.PersistentFlags().BoolVar(&opts.LudicrousMode, "ludicrous_mode", false,
-		"enable zeros and alphas in ludicrous mode.")
 	cmd.PersistentFlags().StringVar(&opts.SnapshotAfter, "snapshot_after", "",
 		"create a new Raft snapshot after this many number of Raft entries.")
 	cmd.PersistentFlags().StringVar(&opts.AlphaFlags, "extra_alpha_flags", "",
@@ -622,6 +743,17 @@ func main() {
 		"minio service port")
 	cmd.PersistentFlags().StringArrayVar(&opts.MinioEnvFile, "minio_env_file", nil,
 		"minio service env_file")
+	cmd.PersistentFlags().StringVar(&opts.ContainerPrefix, "prefix", "",
+		"prefix for the container name")
+	cmd.PersistentFlags().StringArrayVar(&opts.CustomAlphaOptions, "custom_alpha_options", nil,
+		"Custom alpha flags for specific alphas,"+
+			" following {\"1:custom_flags\", \"2:custom_flags\"}, eg: {\"2: -p <bulk_path>\"")
+	cmd.PersistentFlags().StringVar(&opts.Hostname, "hostname", "",
+		"hostname for the alpha and zero servers")
+	cmd.PersistentFlags().BoolVar(&opts.Cdc, "cdc", false,
+		"run Kafka and push CDC data to it")
+	cmd.PersistentFlags().BoolVar(&opts.CdcConsumer, "cdc_consumer", false,
+		"run Kafka consumer that prints out CDC events")
 	err := cmd.ParseFlags(os.Args)
 	if err != nil {
 		if err == pflag.ErrHelp {
@@ -647,8 +779,14 @@ func main() {
 	if opts.UserOwnership && opts.DataDir == "" {
 		fatal(errors.Errorf("--user option requires --data_dir=<path>"))
 	}
-	if cmd.Flags().Changed("ratel_port") && !opts.Ratel {
-		fatal(errors.Errorf("--ratel_port option requires --ratel"))
+	if cmd.Flags().Changed("cdc-consumer") && !opts.Cdc {
+		fatal(errors.Errorf("--cdc_consumer requires --cdc"))
+	}
+	if opts.PDir != "" && opts.DataDir == "" {
+		fatal(errors.Errorf("--postings option requires --data_dir"))
+	}
+	if opts.PDir != "" && opts.NumAlphas > opts.NumReplicas {
+		fatal(errors.Errorf("--postings requires --num_replicas >= --num_alphas"))
 	}
 
 	services := make(map[string]service)
@@ -658,10 +796,24 @@ func main() {
 		services[svc.name] = svc
 	}
 
+	// Alpha Customization
+	customAlphas := make(map[int]string)
+	for _, flag := range opts.CustomAlphaOptions {
+		splits := strings.SplitN(flag, ":", 2)
+		if len(splits) != 2 {
+			fatal(errors.Errorf("custom_alpha_options, requires string in index:options format."))
+		}
+		idx, err := strconv.Atoi(splits[0])
+		if err != nil {
+			fatal(errors.Errorf(" custom_alpha_options, captured erros while parsing index value %v", err))
+		}
+		customAlphas[idx] = splits[1]
+	}
+
 	for i := 1; i <= opts.NumAlphas; i++ {
 		gid := int(math.Ceil(float64(i) / float64(opts.NumReplicas)))
 		rs := fmt.Sprintf("idx=%d; group=%d", i, gid)
-		svc := getAlpha(i, rs)
+		svc := getAlpha(i, rs, customAlphas[i])
 		// Don't make Alphas depend on each other.
 		svc.DependsOn = nil
 		services[svc.name] = svc
@@ -680,7 +832,7 @@ func main() {
 		for i := 1; i <= opts.NumLearners; i++ {
 			lidx++
 			rs := fmt.Sprintf("idx=%d; group=%d; learner=true", lidx, gid)
-			svc := getAlpha(lidx, rs)
+			svc := getAlpha(lidx, rs, customAlphas[i])
 			services[svc.name] = svc
 		}
 	}
@@ -710,16 +862,33 @@ func main() {
 		}
 	}
 
+	if opts.PDir != "" {
+		if _, err := os.Stat(opts.DataDir); !os.IsNotExist(err) {
+			fatal(errors.Errorf("Directory %v already exists.", opts.DataDir))
+		}
+
+		n := 1
+		for n <= opts.NumAlphas {
+			newDir := opts.DataDir + "/alpha" + strconv.Itoa(n) + "/p"
+			err := makeDir(newDir)
+			if err != nil {
+				fatal(errors.Errorf("Couldn't create directory %v. Error: %v.", newDir, err))
+			}
+			err = copyDir(opts.PDir, newDir)
+			if err != nil {
+				fatal(errors.Errorf("Couldn't copy directory from %v to %v. Error: %v.",
+					opts.PDir, newDir, err))
+			}
+			n++
+		}
+	}
+
 	if opts.DataVol {
 		cfg.Volumes["data"] = stringMap{}
 	}
 
 	if opts.Jaeger {
 		services["jaeger"] = getJaeger()
-	}
-
-	if opts.Ratel {
-		services["ratel"] = getRatel()
 	}
 
 	if opts.Metrics {
@@ -745,6 +914,10 @@ func main() {
 		}
 	}
 
+	if opts.Cdc {
+		addCdc(&cfg)
+	}
+
 	yml, err := yaml.Marshal(cfg)
 	x.CheckfNoTrace(err)
 
@@ -762,5 +935,11 @@ func main() {
 		if err != nil {
 			fatal(errors.Errorf("unable to write file: %v", err))
 		}
+	}
+
+	if opts.PDir != "" {
+		fmt.Printf("For new cluster to pick \"postings\", you might have to move uids and timestamp..." +
+			"\n\tcurl \"http://localhost:<zeroPort>/assign?what=timestamps&num=1000000\"" +
+			"\n\tcurl \"http://localhost:<zeroPort>/assign?what=uids&num=1000000\"\n")
 	}
 }
